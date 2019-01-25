@@ -1,4 +1,4 @@
-use super::{Align, File, FileAttribute, FileInfo, FileMode, FileProtocolInfo, FromUefi};
+use super::{File, FileAttribute, FileInfo, FileMode, FileProtocolInfo};
 use crate::prelude::*;
 use crate::Result;
 use core::ffi::c_void;

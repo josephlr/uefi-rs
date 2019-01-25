@@ -2,24 +2,42 @@ use super::FileAttribute;
 use crate::data_types::chars::NUL_16;
 use crate::table::runtime::Time;
 use crate::{unsafe_guid, CStr16, Char16, Identify};
-use core::cmp;
 use core::convert::TryInto;
 use core::ffi::c_void;
 use core::mem;
 use core::slice;
 
+unsafe fn ptr_to_dst<'a, T: ?Sized>(ptr: *mut Char16, len: usize) -> &'a mut T {
+    let mut fat_ptr = slice::from_raw_parts_mut(ptr, len);
+    let info_ref_ptr = &mut fat_ptr as *mut &mut [Char16] as usize as *mut &mut T;
+    *info_ref_ptr
+}
+
 /// Common trait for data structures that can be used with
 /// `File::set_info()` or `File::set_info()`.
 ///
 /// The long-winded name is needed because "FileInfo" is already taken by UEFI.
-pub trait FileProtocolInfo: Align + Identify + FromUefi {}
+pub unsafe trait FileProtocolInfo: Identify {
+    fn name(&self) -> &[Char16];
+    fn name_mut(&mut self) -> &mut [Char16];
 
-/// Trait for querying the alignment of a struct
-///
-/// Needed for dynamic-sized types because `mem::align_of` has a `Sized` bound (due to `dyn Trait`)
-pub trait Align {
+    fn name_str(&self) -> &CStr16 {
+        unsafe { CStr16::from_ptr(&self.name()[0]) }
+    }
+
     /// Required memory alignment for this type
-    fn alignment() -> usize;
+    #[allow(clippy::invalid_ref)]
+    fn alignment() -> usize {
+        // Will not actually dereference null
+        unsafe { mem::align_of_val(mem::zeroed::<&Self>()) }
+    }
+
+    /// Offset of name field
+    #[allow(clippy::invalid_ref)]
+    fn name_offset() -> usize {
+        // Will not actually dereference null
+        unsafe { mem::zeroed::<&Self>().name().as_ptr() as usize }
+    }
 
     /// Assert that some storage is correctly aligned for this type
     fn assert_aligned(storage: &mut [u8]) {
@@ -29,49 +47,32 @@ pub trait Align {
             "The provided storage is not correctly aligned for this type"
         )
     }
-}
 
-/// Trait for going from an UEFI-originated pointer to a Rust reference
-///
-/// This is trivial for `Sized` types, but requires some work when operating on
-/// dynamic-sized types like `NamedFileProtocolInfo`, as the second member of
-/// the fat pointer must be reconstructed using hidden UEFI-provided metadata.
-pub trait FromUefi {
-    /// Turn an UEFI-provided pointer-to-base into a (possibly fat) Rust reference
-    unsafe fn from_uefi<'ptr>(ptr: *mut c_void) -> &'ptr mut Self;
-}
+    /// Turn an UEFI-provided pointer-to-base into a fat Rust reference
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe fn from_uefi<'ptr>(ptr: *mut c_void) -> &'ptr mut Self {
+        let byte_ptr = ptr as *mut u8;
+        let name_ptr = byte_ptr.add(Self::name_offset()) as *mut Char16;
+        let name = CStr16::from_ptr(name_ptr);
+        let name_len = name.to_u16_slice_with_nul().len();
 
-/// Dynamically sized `FileProtocolInfo` with a header and an UCS-2 name
-///
-/// All structs that can currently be queried via Get/SetInfo can be described
-/// as a (possibly empty) header followed by a variable-sized name.
-///
-/// Since such dynamic-sized types are a bit unpleasant to handle in Rust today,
-/// this generic struct was created to deduplicate the relevant code.
-///
-/// The reason why this struct covers the whole DST, as opposed to the
-/// `[Char16]` part only, is that pointers to DSTs are created in a rather
-/// unintuitive way that is best kept centralized in one place.
-#[repr(C)]
-pub struct NamedFileProtocolInfo<Header> {
-    header: Header,
-    name: [Char16],
-}
+        ptr_to_dst(ptr as *mut Char16, name_len)
+    }
 
-impl<Header> NamedFileProtocolInfo<Header> {
-    /// Create a `NamedFileProtocolInfo` structure in user-provided storage
+    /// Create our FileProtocolInfo in user-provided storage
     ///
     /// The structure will be created in-place within the provided storage
     /// buffer. The buffer must be large enough to hold the data structure,
     /// including a null-terminated UCS-2 version of the `name` string.
     ///
     /// The buffer must be correctly aligned. You can query the required
-    /// alignment using the `alignment()` method of the `Align` trait that this
-    /// struct implements.
+    /// alignment using the `alignment()` method.
+    ///
+    /// This method is unsafe as the output value will only have its name field
+    /// initialized. Callers of this function should initiailze other fields.
     #[allow(clippy::cast_ptr_alignment)]
-    fn new_impl<'buf>(
+    unsafe fn new_uninitialized<'buf>(
         storage: &'buf mut [u8],
-        header: Header,
         name: &str,
     ) -> core::result::Result<&'buf mut Self, FileInfoCreationError> {
         // Make sure that the storage is properly aligned
@@ -80,57 +81,28 @@ impl<Header> NamedFileProtocolInfo<Header> {
         // Make sure that the storage is large enough for our needs
         let name_length_ucs2 = name.chars().count() + 1;
         let name_size = name_length_ucs2 * mem::size_of::<Char16>();
-        let info_size = mem::size_of::<Header>() + name_size;
+        let info_size = Self::name_offset() + name_size;
         if storage.len() < info_size {
             return Err(FileInfoCreationError::InsufficientStorage(info_size));
         }
 
-        // Write the header at the beginning of the storage
-        let header_ptr = storage.as_mut_ptr() as *mut Header;
-        unsafe {
-            header_ptr.write(header);
-        }
-
-        // At this point, our storage contains a correct header, followed by
-        // random rubbish. It is okay to reinterpret the rubbish as Char16s
+        // At this point, our storage contains an uninitialized header, followed
+        // by random rubbish. It is okay to reinterpret the rubbish as Char16s
         // because 1/we are going to overwrite it and 2/Char16 does not have a
         // Drop implementation. Thus, we are now ready to build a correctly
         // sized &mut Self and go back to the realm of safe code.
         debug_assert!(!mem::needs_drop::<Char16>());
-        let info_ptr = unsafe {
-            slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut Char16, name_length_ucs2)
-                as *mut [Char16] as *mut Self
-        };
-        let info = unsafe { &mut *info_ptr };
-        debug_assert_eq!(info.name.len(), name_length_ucs2);
+        let info: &mut Self = ptr_to_dst(storage.as_mut_ptr() as *mut Char16, name_length_ucs2);
+        debug_assert_eq!(info.name().len(), name_length_ucs2);
 
         // Write down the UCS-2 name before returning the storage reference
-        for (target, ch) in info.name.iter_mut().zip(name.chars()) {
+        for (target, ch) in info.name_mut().iter_mut().zip(name.chars()) {
             *target = ch
                 .try_into()
                 .map_err(|_| FileInfoCreationError::InvalidChar(ch))?;
         }
-        info.name[name_length_ucs2 - 1] = NUL_16;
+        info.name_mut()[name_length_ucs2 - 1] = NUL_16;
         Ok(info)
-    }
-}
-
-impl<Header> Align for NamedFileProtocolInfo<Header> {
-    fn alignment() -> usize {
-        cmp::max(mem::align_of::<Header>(), mem::align_of::<Char16>())
-    }
-}
-
-impl<Header> FromUefi for NamedFileProtocolInfo<Header> {
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe fn from_uefi<'ptr>(ptr: *mut c_void) -> &'ptr mut Self {
-        let byte_ptr = ptr as *mut u8;
-        let name_ptr = byte_ptr.add(mem::size_of::<Header>()) as *mut Char16;
-        let name = CStr16::from_ptr(name_ptr);
-        let name_len = name.to_u16_slice_with_nul().len();
-        let fat_ptr = slice::from_raw_parts_mut(ptr as *mut Char16, name_len);
-        let self_ptr = fat_ptr as *mut [Char16] as *mut Self;
-        &mut *self_ptr
     }
 }
 
@@ -162,12 +134,9 @@ pub enum FileInfoCreationError {
 ///   existing file in the same directory.
 /// - If a file is read-only, the only allowed change is to remove the read-only
 ///   attribute. Other changes must be carried out in a separate transaction.
-#[unsafe_guid("09576e92-6d3f-11d2-8e39-00a0c969723b")]
-pub type FileInfo = NamedFileProtocolInfo<FileInfoHeader>;
-
-/// Header for generic file information
 #[repr(C)]
-pub struct FileInfoHeader {
+#[unsafe_guid("09576e92-6d3f-11d2-8e39-00a0c969723b")]
+pub struct FileInfo {
     size: u64,
     file_size: u64,
     physical_size: u64,
@@ -175,6 +144,7 @@ pub struct FileInfoHeader {
     last_access_time: Time,
     modification_time: Time,
     attribute: FileAttribute,
+    name: [Char16],
 }
 
 impl FileInfo {
@@ -198,57 +168,61 @@ impl FileInfo {
         attribute: FileAttribute,
         file_name: &str,
     ) -> core::result::Result<&'buf mut Self, FileInfoCreationError> {
-        let header = FileInfoHeader {
-            size: 0,
-            file_size,
-            physical_size,
-            create_time,
-            last_access_time,
-            modification_time,
-            attribute,
-        };
-        let info = Self::new_impl(storage, header, file_name)?;
-        info.header.size = mem::size_of_val(&info) as u64;
+        let info = unsafe { Self::new_uninitialized(storage, file_name)? };
+        info.size = mem::size_of_val(&info) as u64;
+        info.file_size = file_size;
+        info.physical_size = physical_size;
+        info.create_time = create_time;
+        info.last_access_time = last_access_time;
+        info.modification_time = modification_time;
+        info.attribute = attribute;
         Ok(info)
     }
 
     /// File size (number of bytes stored in the file)
     pub fn file_size(&self) -> u64 {
-        self.header.file_size
+        self.file_size
     }
 
     /// Physical space consumed by the file on the file system volume
     pub fn physical_size(&self) -> u64 {
-        self.header.physical_size
+        self.physical_size
     }
 
     /// Time when the file was created
     pub fn create_time(&self) -> &Time {
-        &self.header.create_time
+        &self.create_time
     }
 
     /// Time when the file was last accessed
     pub fn last_access_time(&self) -> &Time {
-        &self.header.last_access_time
+        &self.last_access_time
     }
 
     /// Time when the file's contents were last modified
     pub fn modification_time(&self) -> &Time {
-        &self.header.modification_time
+        &self.modification_time
     }
 
     /// Attribute bits for the file
     pub fn attribute(&self) -> FileAttribute {
-        self.header.attribute
+        self.attribute
     }
 
     /// Name of the file
     pub fn file_name(&self) -> &CStr16 {
-        unsafe { CStr16::from_ptr(&self.name[0]) }
+        self.name_str()
     }
 }
 
-impl FileProtocolInfo for FileInfo {}
+unsafe impl FileProtocolInfo for FileInfo {
+    fn name(&self) -> &[Char16] {
+        &self.name
+    }
+    fn name_mut(&mut self) -> &mut [Char16] {
+        &mut self.name
+    }
+}
 
 /// System volume information
 ///
@@ -256,17 +230,15 @@ impl FileProtocolInfo for FileInfo {}
 ///
 /// Please note that only the system volume's volume label may be set using
 /// this information structure. Consider using `FileSystemVolumeLabel` instead.
-#[unsafe_guid("09576e93-6d3f-11d2-8e39-00a0c969723b")]
-pub type FileSystemInfo = NamedFileProtocolInfo<FileSystemInfoHeader>;
-
-/// Header for system volume information
 #[repr(C)]
-pub struct FileSystemInfoHeader {
+#[unsafe_guid("09576e93-6d3f-11d2-8e39-00a0c969723b")]
+pub struct FileSystemInfo {
     size: u64,
     read_only: bool,
     volume_size: u64,
     free_space: u64,
     block_size: u32,
+    name: [Char16],
 }
 
 impl FileSystemInfo {
@@ -288,55 +260,58 @@ impl FileSystemInfo {
         block_size: u32,
         volume_label: &str,
     ) -> core::result::Result<&'buf mut Self, FileInfoCreationError> {
-        let header = FileSystemInfoHeader {
-            size: 0,
-            read_only,
-            volume_size,
-            free_space,
-            block_size,
-        };
-        let info = Self::new_impl(storage, header, volume_label)?;
-        info.header.size = mem::size_of_val(&info) as u64;
+        let info = unsafe { Self::new_uninitialized(storage, volume_label)? };
+        info.size = mem::size_of_val(&info) as u64;
+        info.read_only = read_only;
+        info.volume_size = volume_size;
+        info.free_space = free_space;
+        info.block_size = block_size;
         Ok(info)
     }
 
     /// Truth that the volume only supports read access
     pub fn read_only(&self) -> bool {
-        self.header.read_only
+        self.read_only
     }
 
     /// Number of bytes managed by the file system
     pub fn volume_size(&self) -> u64 {
-        self.header.volume_size
+        self.volume_size
     }
 
     /// Number of available bytes for use by the file system
     pub fn free_space(&self) -> u64 {
-        self.header.free_space
+        self.free_space
     }
 
     /// Nominal block size by which files are typically grown
     pub fn block_size(&self) -> u32 {
-        self.header.block_size
+        self.block_size
     }
 
     /// Volume label
     pub fn volume_label(&self) -> &CStr16 {
-        unsafe { CStr16::from_ptr(&self.name[0]) }
+        self.name_str()
     }
 }
 
-impl FileProtocolInfo for FileSystemInfo {}
+unsafe impl FileProtocolInfo for FileSystemInfo {
+    fn name(&self) -> &[Char16] {
+        &self.name
+    }
+    fn name_mut(&mut self) -> &mut [Char16] {
+        &mut self.name
+    }
+}
 
 /// System volume label
 ///
 /// May only be obtained on the root directory's file handle.
-#[unsafe_guid("db47d7d3-fe81-11d3-9a35-0090273fc14d")]
-pub type FileSystemVolumeLabel = NamedFileProtocolInfo<FileSystemVolumeLabelHeader>;
-
-/// Header for system volume label information
 #[repr(C)]
-pub struct FileSystemVolumeLabelHeader {}
+#[unsafe_guid("db47d7d3-fe81-11d3-9a35-0090273fc14d")]
+pub struct FileSystemVolumeLabel {
+    name: [Char16],
+}
 
 impl FileSystemVolumeLabel {
     /// Create a `FileSystemVolumeLabel` structure
@@ -352,14 +327,20 @@ impl FileSystemVolumeLabel {
         storage: &'buf mut [u8],
         volume_label: &str,
     ) -> core::result::Result<&'buf mut Self, FileInfoCreationError> {
-        let header = FileSystemVolumeLabelHeader {};
-        Self::new_impl(storage, header, volume_label)
+        unsafe { Self::new_uninitialized(storage, volume_label) }
     }
 
     /// Volume label
     pub fn volume_label(&self) -> &CStr16 {
-        unsafe { CStr16::from_ptr(&self.name[0]) }
+        self.name_str()
     }
 }
 
-impl FileProtocolInfo for FileSystemVolumeLabel {}
+unsafe impl FileProtocolInfo for FileSystemVolumeLabel {
+    fn name(&self) -> &[Char16] {
+        &self.name
+    }
+    fn name_mut(&mut self) -> &mut [Char16] {
+        &mut self.name
+    }
+}
